@@ -1,0 +1,20 @@
+{
+  "name": "typerom-typegen",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "generate-models": "node index.js"
+  },
+  "bin": {
+    "generate-models": "./bin/index.js"
+  },
+  "dependencies": {
+    "ts-morph": "^25.0.0"
+  }
+}
