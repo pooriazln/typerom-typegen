@@ -7,8 +7,7 @@ A simple CLI tool that scans your TypeORM `*.entity.ts` files, extracts decorato
 ## Features
 
 - **Automatic .d.ts generation** – Creates an interface for each `@Entity()` class.
-- **Handles relations** – Decorators such as `@OneToMany('User', 'posts')` become `UserModel[]`.
-- **Highly customizable** – Recognizes columns, relations, and attempts to infer property types.
+- **Handles relations** – Decorators such as `@OneToMany('User', 'posts')` become `UserModel[]`.=
 - **Lightweight** – No need to run a database or start a server; just parse your `.entity.ts` files.
 
 ---
@@ -28,24 +27,25 @@ A simple CLI tool that scans your TypeORM `*.entity.ts` files, extracts decorato
 
         npm i -g .
 
-4.  **Use** the CLI in your project root. Simply run:
+4.  **Create a `base-model.d.ts` file:**
+
+    In your project, create a file named `base-model.d.ts` and add the following:
+
+    ```ts
+    interface BaseModel {
+      id: string;
+      createdAt: Date;
+      updatedAt: Date;
+    }
+    ```
+
+    This ensures that all generated model interfaces extend this base interface.
+
+5.  **Use** the CLI in your project root. Simply run:
 
         generate-models
 
     By default, it will scan for any `*.entity.ts` in the current directory (recursively) and generate `.d.ts` files in a folder named `.models/`.
-
----
-
-## Custom Arguments
-
-You can customize the scan directory and output directory:
-
-- **`--entitiesDir`**: Path to the folder where your `.entity.ts` files live.
-- **`--outDir`**: Path to where the generated `.d.ts` files should be placed.
-
-For example:
-
-    generate-models --entitiesDir "./src" --outDir "./types"
 
 ---
 

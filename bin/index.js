@@ -186,7 +186,7 @@ function main() {
       const propsString = properties
         .map((p) => `  ${p.name}: ${p.type};`)
         .join("\n");
-      fileContent += `interface ${interfaceName} {\n${propsString}\n}\n\n`;
+      fileContent += `interface ${interfaceName} extends BaseModel {\n${propsString}\n}\n\n`;
     } // end for (const entityClass)
 
     // Write to the .d.ts file
