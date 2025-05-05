@@ -1,14 +1,5 @@
 #!/usr/bin/env node
 
-/**
- * generate-models.js
- *
- * An example script using ts-morph to generate .d.ts from TypeORM entity classes.
- *
- * Usage:
- *   node generate-models.js --entitiesDir "path/to/src" --outDir "path/to/.models"
- */
-
 import fs from "fs";
 import path from "path";
 import { Project, SyntaxKind } from "ts-morph";
@@ -40,67 +31,80 @@ function isRelationDecorator(decoratorName) {
   ].includes(decoratorName);
 }
 
-// A helper to convert something like "Invoice" -> "InvoiceModel"
 function toModelName(className) {
   return className + "Model";
+}
+
+function extractEnum(enumType) {
+  const enumDecl = enumType.getSymbol()?.getDeclarations()?.[0];
+  if (
+    !enumDecl ||
+    !enumDecl.getKind ||
+    enumDecl.getKind() !== SyntaxKind.EnumDeclaration
+  )
+    return null;
+
+  const name = enumDecl.getName();
+  const members = enumDecl.getMembers().map((m) => ({
+    name: m.getName(),
+    value: m.getValue(),
+  }));
+
+  return { name, members };
 }
 
 function main() {
   const { entitiesDir, outDir } = parseArgs(process.argv.slice(2));
 
-  // 1. Create a ts-morph Project.
-  // We can optionally point it to a tsconfig if we want the full environment.
-  const project = new Project({
-    skipAddingFilesFromTsConfig: true,
-  });
-
-  // 2. Add all *.entity.ts files in the given folder (recursively).
-  // If you also want subdirectories, you can do "**/*.entity.ts".
+  const project = new Project({ skipAddingFilesFromTsConfig: true });
   project.addSourceFilesAtPaths(path.join(entitiesDir, "**/*.entity.ts"));
 
-  // If you want to explicitly ignore node_modules or other dirs, do so before adding:
-  // e.g., project.addSourceFilesAtPaths("!node_modules"); etc.
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
-  // 3. Ensure outDir exists
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
-  }
-
-  // 4. For each source file, parse the entities
   const sourceFiles = project.getSourceFiles();
-  if (!sourceFiles.length) {
-    console.log("No .entity.ts files found in:", entitiesDir);
-    return;
-  }
+
+  const modelFileMap = {}; // Map className => file name (for imports)
+  const enumMap = {}; // Map enumName => { name, members }
+  const allInterfaceNames = [];
+
+  // First pass: register all model names
+  sourceFiles.forEach((sf) => {
+    sf.getClasses()
+      .filter((cls) =>
+        cls.getDecorators().some((d) => d.getName() === "Entity")
+      )
+      .forEach((cls) => {
+        const name = cls.getName();
+        if (name)
+          modelFileMap[name] = path.basename(sf.getFilePath(), ".entity.ts");
+      });
+  });
 
   sourceFiles.forEach((sourceFile) => {
-    // We'll gather all the classes with @Entity
     const entityClasses = sourceFile
       .getClasses()
       .filter((cls) =>
         cls.getDecorators().some((dec) => dec.getName() === "Entity")
       );
 
-    if (!entityClasses.length) {
-      // This file might have no @Entity classes
-      return;
-    }
+    if (!entityClasses.length) return;
 
-    // We'll create a single .d.ts file per sourceFile, e.g. user.entity.ts -> user.d.ts
     const baseName = path.basename(sourceFile.getFilePath(), ".entity.ts");
-    const dtsFileName = path.join(outDir, baseName + ".d.ts");
+    const tsFileName = path.join(outDir, baseName + ".ts");
 
     let fileContent = `// Auto-generated from ${path.basename(
       sourceFile.getFilePath()
     )}\n\n`;
+    const imports = new Set();
+    const usedEnums = new Map();
 
     for (const entityClass of entityClasses) {
-      // E.g. "User"
       const className = entityClass.getName() || "UnnamedModel";
       const interfaceName = `${className}Model`;
+      allInterfaceNames.push({ file: baseName, name: interfaceName });
 
-      // Gather properties decorated with @Column, @OneToMany, etc.
       const properties = [];
+
       for (const prop of entityClass.getProperties()) {
         const decorators = prop.getDecorators();
         if (decorators.length === 0) continue;
@@ -112,89 +116,107 @@ function main() {
           const decName = dec.getName();
           if (decName === "Column" || isRelationDecorator(decName)) {
             isTypeormProperty = true;
-            if (isRelationDecorator(decName)) {
-              relationDecoratorName = decName;
-            }
+            if (isRelationDecorator(decName)) relationDecoratorName = decName;
           }
         }
 
         if (!isTypeormProperty) continue;
 
-        // If it's a relation, check if we have the entity name in the decorator arguments
-        // e.g. @OneToMany("Invoice", "user")
         if (relationDecoratorName) {
           const relationDec = decorators.find((d) =>
             isRelationDecorator(d.getName())
           );
-          if (relationDec) {
-            // Get the arguments from the decorator
-            const args = relationDec.getCallExpression().getArguments();
-            if (args.length > 0) {
-              const firstArg = args[0];
-              if (firstArg.getKind() === SyntaxKind.StringLiteral) {
-                const targetEntityName = firstArg
-                  .getText()
-                  .replace(/['"]/g, "");
-                // OneToMany => array
-                if (relationDecoratorName === "OneToMany") {
-                  properties.push({
-                    name: prop.getName(),
-                    type: toModelName(targetEntityName) + "[]",
-                  });
-                  continue;
-                } else {
-                  // ManyToOne, OneToOne, etc => single
-                  properties.push({
-                    name: prop.getName(),
-                    type: toModelName(targetEntityName),
-                  });
-                  continue;
-                }
-              }
+          const args = relationDec?.getCallExpression()?.getArguments();
+          const firstArg = args?.[0];
+
+          if (firstArg?.getKind() === SyntaxKind.StringLiteral) {
+            const targetEntity = firstArg.getText().replace(/['"]/g, "");
+            const modelName = toModelName(targetEntity);
+            if (targetEntity !== className) {
+              imports.add({
+                name: modelName,
+                path: `./${modelFileMap[targetEntity]}`,
+              });
             }
+            properties.push({
+              name: prop.getName(),
+              type:
+                modelName + (relationDecoratorName === "OneToMany" ? "[]" : ""),
+            });
+            continue;
           }
         }
 
-        // If it's not recognized as a relation, or couldn't parse it,
-        // we can attempt to resolve the TS type or fallback to 'any'.
-        let typeText = "any";
-        const propType = prop.getType();
-        // e.g. 'string', 'number', 'RoleEnum', etc.
-        const propTypeText = propType.getText();
+        // Fallback to property type
+        const type = prop.getType();
+        let typeText = type.getText();
 
-        // If it's something like 'Invoice[]', we can transform to 'InvoiceModel[]'
-        if (/\[\]$/.test(propTypeText)) {
-          typeText = propTypeText.replace(/\[]$/, "Model[]");
-        } else if (
-          /^[A-Z]/.test(propTypeText) &&
-          !["String", "Number", "Boolean", "Date"].includes(propTypeText)
+        // Inline enums
+        if (
+          type.getSymbol()?.getDeclarations()?.[0]?.getKind() ===
+          SyntaxKind.EnumDeclaration
         ) {
-          // 'Invoice' -> 'InvoiceModel'
-          typeText = propTypeText + "Model";
-        } else {
-          // fallback to whatever we got
-          typeText = propTypeText;
+          const enumInfo = extractEnum(type);
+          if (enumInfo) {
+            usedEnums.set(enumInfo.name, enumInfo);
+            typeText = enumInfo.name;
+          }
+        } else if (/\[\]$/.test(typeText)) {
+          const baseType = typeText.replace(/\[]$/, "");
+          if (modelFileMap[baseType]) {
+            imports.add({
+              name: toModelName(baseType),
+              path: `./${modelFileMap[baseType]}`,
+            });
+            typeText = toModelName(baseType) + "[]";
+          }
+        } else if (modelFileMap[typeText]) {
+          imports.add({
+            name: toModelName(typeText),
+            path: `./${modelFileMap[typeText]}`,
+          });
+          typeText = toModelName(typeText);
         }
 
-        properties.push({
-          name: prop.getName(),
-          type: typeText,
-        });
-      } // end for (const prop)
+        properties.push({ name: prop.getName(), type: typeText });
+      }
 
-      // Construct the interface for this entity class
       const propsString = properties
         .map((p) => `  ${p.name}: ${p.type};`)
         .join("\n");
-      fileContent += `interface ${interfaceName} extends BaseModel {\n${propsString}\n}\n\n`;
-    } // end for (const entityClass)
+      fileContent += `export interface ${interfaceName} extends BaseModel {\n${propsString}\n}\n\n`;
+    }
 
-    // Write to the .d.ts file
-    fs.writeFileSync(dtsFileName, fileContent.trim() + "\n");
-    console.log(`Generated: ${dtsFileName}`);
+    // Add imports at the top
+    let importLines = "";
+    imports.forEach((imp) => {
+      if (imp.path !== `./${baseName}`) {
+        importLines += `import { ${imp.name} } from '${imp.path}';\n`;
+      }
+    });
+    if (importLines) fileContent = importLines + "\n" + fileContent;
+
+    // Add inlined enums at the bottom
+    usedEnums.forEach((enumObj) => {
+      const members = enumObj.members
+        .map((m) => `  ${m.name} = ${JSON.stringify(m.value)},`)
+        .join("\n");
+      fileContent += `export enum ${enumObj.name} {\n${members}\n}\n\n`;
+    });
+
+    fs.writeFileSync(tsFileName, fileContent.trim() + "\n");
+    console.log(`✅ Generated: ${tsFileName}`);
   });
 
-  console.log("Done generating .d.ts files!");
+  // Generate index.d.ts
+  const indexContent = allInterfaceNames
+    .map((entry) => `export * from './${entry.file}';`)
+    .join("\n");
+
+  fs.writeFileSync(path.join(outDir, "index.d.ts"), indexContent);
+  console.log("Generated: index.d.ts");
+
+  console.log("✨ Done generating .ts model files!");
 }
 
 main();
