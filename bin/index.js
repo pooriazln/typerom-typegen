@@ -56,18 +56,27 @@ function extractEnum(enumType) {
 function main() {
   const { entitiesDir, outDir } = parseArgs(process.argv.slice(2));
 
+  const lifecycleDecorators = new Set([
+    "AfterLoad",
+    "BeforeInsert",
+    "AfterInsert",
+    "BeforeUpdate",
+    "AfterUpdate",
+  ]);
+
   const project = new Project({ skipAddingFilesFromTsConfig: true });
-  project.addSourceFilesAtPaths(path.join(entitiesDir, "**/*.entity.ts"));
+  project.addSourceFilesAtPaths([
+    path.join(entitiesDir, "**/*.entity.ts"),
+    path.join(entitiesDir, "**/*.type.ts"),
+  ]);
 
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
   const sourceFiles = project.getSourceFiles();
-
-  const modelFileMap = {}; // Map className => file name (for imports)
-  const enumMap = {}; // Map enumName => { name, members }
+  const modelFileMap = {};
   const allInterfaceNames = [];
 
-  // First pass: register all model names
+  // Register all model names
   sourceFiles.forEach((sf) => {
     sf.getClasses()
       .filter((cls) =>
@@ -75,148 +84,204 @@ function main() {
       )
       .forEach((cls) => {
         const name = cls.getName();
-        if (name)
+        if (name) {
           modelFileMap[name] = path.basename(sf.getFilePath(), ".entity.ts");
+        }
       });
   });
 
+  // Generate BaseModel from BaseEntity into base-model.ts
+  const baseModelInterface = "BaseModel";
+  const baseModelFile = path.join(outDir, `base-model.ts`);
+  const baseClasses = project
+    .getSourceFiles()
+    .flatMap((sf) =>
+      sf.getClasses().filter((c) => c.getName() === "BaseEntity")
+    );
+
+  if (baseClasses.length) {
+    const baseCls = baseClasses[0];
+    const baseProps = [];
+    const autoBase = new Set();
+
+    // detect lifecycle-assigned props
+    baseCls.getMethods().forEach((m) => {
+      const decs = m.getDecorators().map((d) => d.getName());
+      if (decs.some((d) => lifecycleDecorators.has(d))) {
+        m.getBody()
+          ?.getDescendantsOfKind(SyntaxKind.BinaryExpression)
+          .forEach((be) => {
+            const lhs = be.getLeft();
+            if (
+              lhs.getKind() === SyntaxKind.PropertyAccessExpression &&
+              lhs.getExpression().getText() === "this"
+            ) {
+              autoBase.add(lhs.getName());
+            }
+          });
+      }
+    });
+
+    // include any decorator ending with 'Column'
+    baseCls.getProperties().forEach((prop) => {
+      const name = prop.getName();
+      const decs = prop.getDecorators().map((d) => d.getName());
+      const hasCol = decs.some((n) => n.endsWith("Column"));
+      const isAuto = autoBase.has(name);
+      if (!hasCol && !isAuto) return;
+      baseProps.push({ name, type: prop.getType().getText() });
+    });
+
+    // write base-model.ts
+    let baseContent = `// Auto-generated BaseModel from BaseEntity\n\n`;
+    baseContent += `export interface ${baseModelInterface} {\n`;
+    baseProps.forEach((p) => {
+      baseContent += `  ${p.name}: ${p.type};\n`;
+    });
+    baseContent += `}\n`;
+
+    fs.writeFileSync(baseModelFile, baseContent);
+    console.log(`Generated BaseModel: ${baseModelFile}`);
+  }
+
+  // Generate models
   sourceFiles.forEach((sourceFile) => {
     const entityClasses = sourceFile
       .getClasses()
       .filter((cls) =>
         cls.getDecorators().some((dec) => dec.getName() === "Entity")
       );
-
     if (!entityClasses.length) return;
 
     const baseName = path.basename(sourceFile.getFilePath(), ".entity.ts");
-    const tsFileName = path.join(outDir, baseName + ".ts");
+    const outFile = path.join(outDir, baseName + ".ts");
 
     let fileContent = `// Auto-generated from ${path.basename(
       sourceFile.getFilePath()
     )}\n\n`;
     const imports = new Set();
+    imports.add(`import { ${baseModelInterface} } from './base-model';`);
     const usedEnums = new Map();
 
-    for (const entityClass of entityClasses) {
+    entityClasses.forEach((entityClass) => {
       const className = entityClass.getName() || "UnnamedModel";
       const interfaceName = `${className}Model`;
       allInterfaceNames.push({ file: baseName, name: interfaceName });
-
       const properties = [];
 
-      for (const prop of entityClass.getProperties()) {
-        const decorators = prop.getDecorators();
-        if (decorators.length === 0) continue;
-
-        let isTypeormProperty = false;
-        let relationDecoratorName = null;
-
-        for (const dec of decorators) {
-          const decName = dec.getName();
-          if (decName === "Column" || isRelationDecorator(decName)) {
-            isTypeormProperty = true;
-            if (isRelationDecorator(decName)) relationDecoratorName = decName;
-          }
+      // detect auto-loaded props
+      const autoProps = new Set();
+      entityClass.getMethods().forEach((method) => {
+        const mdecs = method.getDecorators().map((d) => d.getName());
+        if (mdecs.some((d) => lifecycleDecorators.has(d))) {
+          method
+            .getBody()
+            ?.getDescendantsOfKind(SyntaxKind.BinaryExpression)
+            .forEach((be) => {
+              const lhs = be.getLeft();
+              if (
+                lhs.getKind() === SyntaxKind.PropertyAccessExpression &&
+                lhs.getExpression().getText() === "this"
+              ) {
+                autoProps.add(lhs.getName());
+              }
+            });
         }
+      });
 
-        if (!isTypeormProperty) continue;
+      // process properties
+      entityClass.getProperties().forEach((prop) => {
+        const pName = prop.getName();
+        const decorators = prop.getDecorators();
+        const names = decorators.map((d) => d.getName());
+        const hasColumn = names.some((n) => n.endsWith("Column"));
+        const rel = decorators.find((d) => isRelationDecorator(d.getName()));
+        const isVirtual = names.includes("VirtualColumn");
+        const shouldAuto = autoProps.has(pName);
+        if (!hasColumn && !rel && !shouldAuto) return;
 
-        if (relationDecoratorName) {
-          const relationDec = decorators.find((d) =>
-            isRelationDecorator(d.getName())
-          );
-          const args = relationDec?.getCallExpression()?.getArguments();
-          const firstArg = args?.[0];
-
-          if (firstArg?.getKind() === SyntaxKind.StringLiteral) {
-            const targetEntity = firstArg.getText().replace(/['"]/g, "");
-            const modelName = toModelName(targetEntity);
-            if (targetEntity !== className) {
-              imports.add({
-                name: modelName,
-                path: `./${modelFileMap[targetEntity]}`,
-              });
+        // relations
+        if (rel) {
+          const args = rel.getCallExpression()?.getArguments();
+          const first = args?.[0];
+          if (first?.getKind() === SyntaxKind.StringLiteral) {
+            const target = first.getText().replace(/['"]/g, "");
+            const mname = toModelName(target);
+            if (target !== className) {
+              imports.add(
+                `import { ${mname} } from './${modelFileMap[target]}';`
+              );
             }
             properties.push({
-              name: prop.getName(),
-              type:
-                modelName + (relationDecoratorName === "OneToMany" ? "[]" : ""),
+              name: pName,
+              type: mname + (rel.getName() === "OneToMany" ? "[]" : ""),
             });
-            continue;
+            return;
           }
         }
 
-        // Fallback to property type
-        const type = prop.getType();
-        let typeText = type.getText();
-
-        // Inline enums
-        if (
-          type.getSymbol()?.getDeclarations()?.[0]?.getKind() ===
-          SyntaxKind.EnumDeclaration
-        ) {
-          const enumInfo = extractEnum(type);
-          if (enumInfo) {
-            usedEnums.set(enumInfo.name, enumInfo);
-            typeText = enumInfo.name;
-          }
-        } else if (/\[\]$/.test(typeText)) {
-          const baseType = typeText.replace(/\[]$/, "");
-          if (modelFileMap[baseType]) {
-            imports.add({
-              name: toModelName(baseType),
-              path: `./${modelFileMap[baseType]}`,
-            });
-            typeText = toModelName(baseType) + "[]";
-          }
-        } else if (modelFileMap[typeText]) {
-          imports.add({
-            name: toModelName(typeText),
-            path: `./${modelFileMap[typeText]}`,
-          });
-          typeText = toModelName(typeText);
+        // virtual columns
+        if (isVirtual) {
+          properties.push({ name: pName, type: prop.getType().getText() });
+          return;
         }
 
-        properties.push({ name: prop.getName(), type: typeText });
-      }
+        // auto-loaded props
+        if (shouldAuto) {
+          properties.push({ name: pName, type: prop.getType().getText() });
+          return;
+        }
 
-      const propsString = properties
+        // fallback
+        let tText = prop.getType().getText();
+        const enumInfo = extractEnum(prop.getType());
+        if (enumInfo) {
+          usedEnums.set(enumInfo.name, enumInfo);
+          tText = enumInfo.name;
+        } else if (/\[\]$/.test(tText)) {
+          const bt = tText.replace(/\[\]$/, "");
+          if (modelFileMap[bt]) {
+            const mn = toModelName(bt);
+            imports.add(`import { ${mn} } from './${modelFileMap[bt]}';`);
+            tText = mn + "[]";
+          }
+        } else if (modelFileMap[tText]) {
+          const mn = toModelName(tText);
+          imports.add(`import { ${mn} } from './${modelFileMap[tText]}';`);
+          tText = mn;
+        }
+        properties.push({ name: pName, type: tText });
+      });
+
+      // build interface
+      const propsStr = properties
         .map((p) => `  ${p.name}: ${p.type};`)
         .join("\n");
-      fileContent += `export interface ${interfaceName} extends BaseModel {\n${propsString}\n}\n\n`;
-    }
-
-    // Add imports at the top
-    let importLines = "";
-    imports.forEach((imp) => {
-      if (imp.path !== `./${baseName}`) {
-        importLines += `import { ${imp.name} } from '${imp.path}';\n`;
-      }
-    });
-    if (importLines) fileContent = importLines + "\n" + fileContent;
-
-    // Add inlined enums at the bottom
-    usedEnums.forEach((enumObj) => {
-      const members = enumObj.members
-        .map((m) => `  ${m.name} = ${JSON.stringify(m.value)},`)
-        .join("\n");
-      fileContent += `export enum ${enumObj.name} {\n${members}\n}\n\n`;
+      fileContent += `export interface ${interfaceName} extends ${baseModelInterface} {\n${propsStr}\n}\n\n`;
     });
 
-    fs.writeFileSync(tsFileName, fileContent.trim() + "\n");
-    console.log(`✅ Generated: ${tsFileName}`);
+    // write file
+    const impBlock = Array.from(imports).join("\n");
+    fileContent = impBlock + "\n\n" + fileContent;
+
+    usedEnums.forEach(({ name, members }) => {
+      fileContent += `export enum ${name} {\n`;
+      members.forEach(({ name: m, value }) => {
+        fileContent += `  ${m} = ${JSON.stringify(value)},\n`;
+      });
+      fileContent += `}\n\n`;
+    });
+
+    fs.writeFileSync(outFile, fileContent.trim() + "\n");
+    console.log(`Generated: ${outFile}`);
   });
 
-  // Generate index.d.ts
-  const indexContent = allInterfaceNames
-    .map((entry) => `export * from './${entry.file}';`)
+  // index.d.ts
+  const idx = allInterfaceNames
+    .map((e) => `export * from './${e.file}';`)
     .join("\n");
-
-  fs.writeFileSync(path.join(outDir, "index.d.ts"), indexContent);
-  console.log("Generated: index.d.ts");
-
-  console.log("✨ Done generating .ts model files!");
+  fs.writeFileSync(path.join(outDir, "index.ts"), idx + "\n");
+  console.log("Generated index.d.ts");
 }
 
 main();
