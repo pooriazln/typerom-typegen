@@ -1,74 +1,97 @@
-# TypeORM .d.ts Generator
+# typerom-typegen
 
-A simple CLI tool that scans your TypeORM `*.entity.ts` files, extracts decorators like `@Entity()`, `@Column()`, `@OneToMany()`, etc., and generates corresponding `.d.ts` interface files. Perfect for sharing entity structures with frontend applications or other consumers who need type definitions without bundling your entire server code.
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-5FA04E?style=for-the-badge&logo=nodedotjs&logoColor=white)
+![ts-morph](https://img.shields.io/badge/ts--morph-0098EA?style=for-the-badge&logoColor=white)
+![License](https://img.shields.io/badge/License-Apache_2.0-D2774B?style=for-the-badge)
 
----
+A CLI that statically parses your TypeORM entities and generates plain TypeScript
+interfaces from them — so your frontend can share the exact shape of your data
+**without importing server code, a database driver, or TypeORM itself.**
 
-## Features
+No runtime, no DB connection. It reads your `*.entity.ts` files with `ts-morph`,
+resolves relations and enums, and writes a clean `.models/` folder you can ship
+anywhere.
 
-- **Automatic .d.ts generation** – Creates an interface for each `@Entity()` class.
-- **Handles relations** – Decorators such as `@OneToMany('User', 'posts')` become `UserModel[]`.=
-- **Lightweight** – No need to run a database or start a server; just parse your `.entity.ts` files.
+## Why
 
----
+Hand-copying entity types into the frontend rots the moment a column changes.
+This keeps one source of truth (your entities) and regenerates the types on demand.
 
-## Quick Start
+## Install
 
-1.  **Clone the repository:**
+```bash
+git clone https://github.com/pooriazln/typerom-typegen.git
+cd typerom-typegen
+npm install
+npm i -g .        # exposes the `generate-models` command
+```
 
-        git clone https://github.com/pooriazln/typerom-typegen.git
-        cd typerom-typegen
+## Usage
 
-2.  **Install dependencies** using your preferred package manager (npm, pnpm, or yarn). For example:
+From your project root:
 
-        npm install
+```bash
+generate-models                                  # scans ./**/*.entity.ts → ./.models
+generate-models --entitiesDir src --outDir types # custom in/out
+```
 
-3.  **Install the CLI globally:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--entitiesDir` | `cwd` | Where to scan for `*.entity.ts` / `*.type.ts` |
+| `--outDir` | `./.models` | Where to write the generated interfaces |
 
-        npm i -g .
+`node_modules`, `dist`, etc. are ignored automatically.
 
-4.  **Create a `base-model.d.ts` file:**
+## Example
 
-    In your project, create a file named `base-model.d.ts` and add the following:
+**In** — `user.entity.ts`:
 
-    ```ts
-    interface BaseModel {
-      id: string;
-      createdAt: Date;
-      updatedAt: Date;
-    }
-    ```
+```ts
+@Entity()
+export class User extends BaseEntity {
+  @Column() email: string;
+  @Column({ type: 'enum', enum: Role }) role: Role;
+  @OneToMany('Post', 'author') posts: Post[];
+}
+```
 
-    This ensures that all generated model interfaces extend this base interface.
+**Out** — `.models/user.ts`:
 
-5.  **Use** the CLI in your project root. Simply run:
+```ts
+import { BaseModel } from './base-model';
+import { PostModel } from './post';
 
-        generate-models
+export interface UserModel extends BaseModel {
+  email: string;
+  role: Role;
+  posts: PostModel[];
+}
 
-    By default, it will scan for any `*.entity.ts` in the current directory (recursively) and generate `.d.ts` files in a folder named `.models/`.
+export enum Role {
+  Admin = "admin",
+  User = "user",
+}
+```
 
----
+`BaseModel` is derived automatically from your `BaseEntity` class (any `*Column`
+property plus fields set in lifecycle hooks like `@AfterLoad`), and an `index.ts`
+barrel re-exports everything.
 
-## Typical NestJS Workflow
+## What it handles
 
-If your entities are spread across multiple modules, simply run `generate-models` from your project root (after installing it globally). The tool will **ignore** common directories like `node_modules`, `dist`, etc. If you have an unusual project structure, you can specify multiple directories or use globs.
+- `@Entity()` classes → `XModel` interfaces
+- Relations → `@OneToMany` becomes `TargetModel[]`, others `TargetModel`
+- `enum` columns → inlined `export enum`
+- `@VirtualColumn` and lifecycle-assigned fields
+- A shared `BaseModel` from `BaseEntity`
 
----
+## Limitations
 
-## Troubleshooting
-
-- **No files generated**: Make sure you are in the **project root** containing your `.entity.ts` files (or pass `--entitiesDir` pointing to the source folder).
-- **Empty interfaces**: Ensure the files are untranspiled `.ts` (not compiled `.js`) and you have `@Entity()` decorators.
-- **Errors**: Check if you have the right permissions and that your entities do not live in ignored folders (`node_modules`, etc.).
-
----
-
-## Contributing
-
-Feel free to submit issues or PRs if you find bugs or have feature requests. This tool aims to handle the most common patterns in TypeORM entity definitions, but edge cases or advanced configurations can arise.
-
----
+Static analysis only — it reads decorators, it doesn't run your code. Entities must
+be untranspiled `.ts` with real `@Entity()` decorators, and you should have a
+`BaseEntity` class for `BaseModel` to resolve.
 
 ## License
 
-MIT License. See [LICENSE](./LICENSE) for more details. Enjoy generating those types!
+[Apache-2.0](./LICENSE)
